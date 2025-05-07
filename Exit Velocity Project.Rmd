@@ -1,6 +1,6 @@
 ---
-title: "CHS_Marlins_Final_R_Markdown"
-author: "Christopher Sousounis"
+title: "Exit Velocity Projection
+author: 
 date: "2025-05-04"
 output: html_document
 ---
