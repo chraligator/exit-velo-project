@@ -1,0 +1,468 @@
+---
+title: "CHS_Marlins_Final_R_Markdown"
+author: "Christopher Sousounis"
+date: "2025-05-04"
+output: html_document
+---
+
+Run all chunks once, in order, to obtain final result. Make sure relevant packages are installed.
+
+```{r}
+library(dplyr)
+library(xgboost)
+library(readr)
+# Load data
+train <- read.csv("C:/Users/chsou/OneDrive/Documents/Marlins Data Project/exit_velo_project_data.csv")
+validate <- read.csv("C:/Users/chsou/OneDrive/Documents/Marlins Data Project/exit_velo_validate_data.csv")
+```
+
+```{r}
+## Preprocessing
+
+# Remove bunts
+train <- train %>% filter(hit_type != "bunt")
+
+# Remove rows with missing exit velocity
+train <- train %>% drop_na(exit_velo, age, level_abbr)
+train %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+```
+
+
+```{r}
+# -----------------------------
+# Step 1: Load and prepare data
+# -----------------------------
+
+# Remove bunts
+train <- train %>% filter(hit_type != "bunt") %>% filter(!is.na(exit_velo))
+
+# Feature selection
+excluded_vars <- c("exit_velo", "level_abbr", "age", "outcome")
+feature_vars <- setdiff(names(train), excluded_vars)
+
+# Filter complete cases and prepare training set
+row_mask <- complete.cases(train[, feature_vars])
+train_model_data <- train[row_mask, ] %>%
+  select(all_of(feature_vars), exit_velo)
+
+# Align meta info exactly to rows used in training
+meta_info <- train[row_mask, c("batter_id", "season", "age")]
+
+# -----------------------------
+# Step 2: Clean factors
+# -----------------------------
+clean_factors <- function(df) {
+  df %>%
+    mutate(across(where(is.character), as.factor)) %>%
+    mutate(across(where(is.factor), ~ droplevels(.))) %>%
+    select(where(~ !is.factor(.) || nlevels(.) > 1))
+}
+
+train_model_data <- clean_factors(train_model_data)
+
+# -----------------------------
+# Step 3: Train XGBoost model
+# -----------------------------
+xgb_formula <- as.formula(paste("~", paste(setdiff(names(train_model_data), "exit_velo"), collapse = "+")))
+X_train <- model.matrix(xgb_formula, data = train_model_data)[, -1]
+y_train <- train_model_data$exit_velo
+
+xgb_model <- xgboost(
+  data = X_train,
+  label = y_train,
+  objective = "reg:squarederror",
+  nrounds = 100,
+  verbose = 0
+)
+
+# -----------------------------
+# Step 4: Get fitted values and aggregate
+# -----------------------------
+fitted_ev <- predict(xgb_model, newdata = X_train)
+
+# 🔹 NEW: Add fitted_ev to the corresponding rows of the original training data
+train_with_fitted_ev <- train[row_mask, ] %>%
+  mutate(fitted_ev = fitted_ev)
+
+# (Optional: view or inspect)
+head(train_with_fitted_ev)
+
+# Continue as before
+meta_info_with_level <- train[row_mask, c("batter_id", "season", "age", "level_abbr")]
+
+# Combine with fitted values
+fitted_data <- meta_info_with_level %>% bind_cols(fitted_ev = fitted_ev)
+
+# Summarize per batter-season
+batter_season_ev <- fitted_data %>%
+  group_by(batter_id, season, age) %>%
+  summarize(
+    true_ev = mean(fitted_ev),
+    sd_ev = sd(fitted_ev),
+    n = n(),
+    n_mlb = sum(level_abbr == "mlb"),
+    n_aaa = sum(level_abbr == "aaa"),
+    n_aa  = sum(level_abbr == "aa"),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# Step 5: Calculate R-squared
+# -----------------------------
+
+# Actual and predicted values
+y_true <- y_train
+y_pred <- fitted_ev
+
+# R-squared calculation
+ss_res <- sum((y_true - y_pred)^2)                     # Residual sum of squares
+ss_tot <- sum((y_true - mean(y_true))^2)               # Total sum of squares
+r_squared <- 1 - (ss_res / ss_tot)
+
+# View result
+r_squared
+
+```
+
+
+```{r}
+aggregated <- train_with_fitted_ev %>% group_by(batter_id, season, age) %>% summarise(mean_ev = mean(exit_velo), n = n(), ev_sd = sd(exit_velo)/sqrt(n), mean_fit_ev = mean(fitted_ev), sd_fit_ev = sd(fitted_ev)/sqrt(n), n_mlb = sum(level_abbr == "mlb"), n_aaa = sum(level_abbr == "aaa"), n_aa = sum(level_abbr == "aa")) %>% ungroup()
+
+aggregated
+```
+
+Further Stabilization of Fitted Mean Exit Velocity
+```{r}
+plot(mean_fit_ev~n, aggregated)
+```
+
+```{r}
+library(FNN)
+library(tidyr)
+
+indices <- which(aggregated$n < 100)
+low_n_batters <- aggregated$batter_id[indices]
+
+# STEP 1: Identify batters with low sample size
+low_n_threshold <- 100
+
+low_n_batters <- aggregated %>%
+  filter(n < low_n_threshold)
+
+# Add handedness and height from original data
+batter_traits <- train_with_fitted_ev %>%
+  select(batter_id, season, batter_height, batter_hand) %>%
+  distinct()
+
+low_n_batters <- low_n_batters %>%
+  left_join(batter_traits, by = c("batter_id", "season")) %>%
+  mutate(handedness = case_when(
+    batter_hand == "R" ~ 0,
+    batter_hand == "L" ~ 1,
+    TRUE ~ 0.5
+  ))
+
+# STEP 2: Create reference pool of eligible batter-seasons with known EV
+reference_pool <- aggregated %>%
+  filter(n >= low_n_threshold) %>%
+  left_join(batter_traits, by = c("batter_id", "season")) %>%
+  mutate(handedness = case_when(
+    batter_hand == "R" ~ 0,
+    batter_hand == "L" ~ 1,
+    TRUE ~ 0.5
+  ))
+
+# STEP 3: Loop over each low-n batter-season to compute stabilized EV
+stabilized_results <- list()
+
+for (i in seq_len(nrow(low_n_batters))) {
+  row <- low_n_batters[i, ]
+  n_missing <- low_n_threshold - row$n
+
+  # Find 5 nearest neighbors in the same season
+  ref_in_season <- reference_pool %>%
+    filter(season == row$season)
+
+  if (nrow(ref_in_season) < 5) next  # skip if not enough peers
+
+  nn_result <- get.knnx(
+    data = ref_in_season %>% select(age, batter_height, handedness),
+    query = row %>% select(age, batter_height, handedness),
+    k = 5
+  )
+
+  neighbor_ids <- ref_in_season$batter_id[nn_result$nn.index[1, ]]
+
+  # Sample batted balls from those peers
+  peer_obs <- train_with_fitted_ev %>%
+    filter(season == row$season, batter_id %in% neighbor_ids)
+
+  sampled_peers <- peer_obs %>%
+    sample_n(n_missing, replace = TRUE)
+
+  # Get original batted balls
+  orig_obs <- train_with_fitted_ev %>%
+    filter(season == row$season, batter_id == row$batter_id)
+
+  # Combine sampled + original observations
+  combined_obs <- bind_rows(orig_obs, sampled_peers)
+
+  # Count number of each level
+  level_mix <- combined_obs %>%
+    count(level_abbr) %>%
+    pivot_wider(
+      names_from = level_abbr,
+      values_from = n,
+      names_prefix = "n_",
+      values_fill = 0
+    )
+
+  # Final metrics
+  mean_ev <- mean(combined_obs$fitted_ev)
+  sample_size <- nrow(combined_obs)
+  standard_error <- sd(combined_obs$fitted_ev) / sqrt(sample_size)
+
+  # Combine into result row
+  result_row <- data.frame(
+    batter_id = row$batter_id,
+    season = row$season,
+    stabilized_ev = mean_ev,
+    sample_size = sample_size,
+    standard_error = standard_error
+  ) %>% bind_cols(level_mix)
+
+  stabilized_results[[i]] <- result_row
+}
+
+# STEP 4: Combine all results into a single dataframe
+stabilized_ev_df <- bind_rows(stabilized_results)
+stabilized_ev_df
+```
+
+```{r}
+interim_aggregated <- aggregated %>% left_join(stabilized_ev_df, by = c("batter_id", "season")) %>% mutate(n = ifelse(n < 100, sample_size, n)) %>% mutate(
+    n_aa.x = ifelse(is.na(n_aa.y), n_aa.x, n_aa.y),
+    n_aaa.x = ifelse(is.na(n_aaa.y), n_aaa.x, n_aaa.y),
+    n_mlb.x = ifelse(is.na(n_mlb.y), n_mlb.x, n_mlb.y),
+    sd_fit_ev = ifelse(!is.na(standard_error), standard_error, sd_fit_ev),
+    mean_fit_ev = ifelse(!is.na(stabilized_ev), stabilized_ev, mean_fit_ev)) %>% rename(n_aa = n_aa.x, n_aaa = n_aaa.x, n_mlb = n_mlb.x)
+interim_aggregated
+final_aggregated <- interim_aggregated[,1:11]
+
+final_aggregated
+
+```
+
+
+Generating a level and age adjustment
+```{r}
+# We test for differences in the center of the exit velocity distributions by level
+
+kruskal.test(fitted_ev ~ level_abbr, data = train_with_fitted_ev)
+pairwise.wilcox.test(train_with_fitted_ev$fitted_ev, train_with_fitted_ev$level_abbr, p.adjust.method = "holm")
+
+# Because the median exit velocity differs by level, we will adjust the projected exit velocity by a weighted average of the factors, depending on how many batted balls the batter hit at each level in their most recent season.
+
+library(dplyr)
+
+# Step 1: Compute mean, variance, and count of fitted EV by level
+ev_by_level <- train_with_fitted_ev %>%
+  filter(hit_type != "bunt", !is.na(fitted_ev), !is.na(level_abbr)) %>%
+  group_by(level_abbr) %>%
+  summarize(
+    mean_ev = mean(fitted_ev),
+    var_ev = var(fitted_ev),
+    count = n(),
+    .groups = "drop"
+  )
+
+# Step 2: Get MLB values
+mlb_stats <- ev_by_level %>%
+  filter(tolower(level_abbr) == "mlb") %>%
+  select(mlb_mean = mean_ev, mlb_var = var_ev, mlb_n = count)
+
+# Step 3: Join MLB stats to each row to compute variance of the difference
+level_adjustments <- ev_by_level %>%
+  filter(tolower(level_abbr) != "mlb") %>%  # Skip MLB vs. itself
+  mutate(key = 1) %>%
+  left_join(mutate(mlb_stats, key = 1), by = "key") %>%
+  mutate(
+    level_adj = mlb_mean - mean_ev,
+    var_diff = (mlb_var / mlb_n) + (var_ev / count),
+    se_diff = sqrt(var_diff)
+  ) %>%
+  select(level_abbr, level_adj, var_diff, se_diff, count)
+
+# View result
+print(level_adjustments)
+```
+
+
+```{r}
+age_data <- final_aggregated %>% select(batter_id, season, age, mean_fit_ev)
+
+library(dplyr)
+
+# Define ordered age group bins
+age_group_levels <- c("<24", "24–25", "26–27", "28–29", "30–32", "33+")
+
+# 1. Assign age groups
+assign_age_group <- function(age) {
+  case_when(
+    age < 24 ~ "<24",
+    age >= 24 & age < 26 ~ "24–25",
+    age >= 26 & age < 28 ~ "26–27",
+    age >= 28 & age < 30 ~ "28–29",
+    age >= 30 & age < 33 ~ "30–32",
+    age >= 33 ~ "33+"
+  )
+}
+
+# 2. Prepare age_data with age group factor
+age_data <- final_aggregated %>%
+  select(batter_id, season, age, mean_fit_ev) %>%
+  mutate(age_group = factor(assign_age_group(age), levels = age_group_levels))
+
+# 3. Filter for players with at least 2 distinct age groups
+valid_players <- age_data %>%
+  group_by(batter_id) %>%
+  summarize(n_age_groups = n_distinct(age_group), .groups = "drop") %>%
+  filter(n_age_groups >= 2)
+
+age_data_filtered <- age_data %>%
+  semi_join(valid_players, by = "batter_id")
+
+# 4. Filter to players with only consecutive seasons
+age_data_filtered <- age_data_filtered %>%
+  arrange(batter_id, season) %>%
+  group_by(batter_id) %>%
+  mutate(season_diff = season - lag(season)) %>%
+  filter(is.na(season_diff) | season_diff == 1) %>%
+  ungroup()
+
+# 5. Compute age group transitions
+age_group_progression <- age_data_filtered %>%
+  arrange(batter_id, season) %>%
+  group_by(batter_id) %>%
+  mutate(
+    next_ev = lead(mean_fit_ev),
+    next_age_group = lead(age_group)
+  ) %>%
+  filter(!is.na(next_ev), age_group != next_age_group) %>%
+  ungroup()
+
+# 6. Summarize average EV delta (adjustment) when moving FROM this age group TO the next
+main_curve <- age_group_progression %>%
+  group_by(age_group) %>%
+  summarize(
+    adjustment = mean(next_ev - mean_fit_ev, na.rm = TRUE),
+    adjustment_variance = var(next_ev - mean_fit_ev, na.rm = TRUE),
+    mean_fit_ev = mean(mean_fit_ev, na.rm = TRUE),
+    n_transitions = n(),
+    .groups = "drop"
+  )
+
+# 7. Manually add "33+" group from age_data
+group_33_plus <- age_data_filtered %>%
+  filter(age_group == "33+") %>%
+  summarize(
+    age_group = factor("33+", levels = age_group_levels),
+    mean_ev_delta = NA_real_,
+    mean_fit_ev = mean(mean_fit_ev, na.rm = TRUE),
+    n_transitions = 0
+  )
+
+# 8. Combine and sort
+empirical_age_group_curve <- bind_rows(main_curve, group_33_plus) %>%
+  arrange(factor(age_group, levels = age_group_levels))
+
+# Final table
+empirical_age_group_curve
+
+```
+
+```{r}
+latest_season_data <- final_aggregated %>%
+  group_by(batter_id) %>%
+  filter(season == max(season)) %>%
+  ungroup()
+
+```
+
+```{r}
+level_constants <- c(
+  aa = level_adjustments$level_adj[1],
+  aaa = level_adjustments$level_adj[2],
+  mlb = 0.0
+)
+
+level_cols <- paste0("n_", names(level_constants))
+
+big <- latest_season_data %>%
+  rowwise() %>%
+  mutate(
+    # extract batted ball counts as numeric vector
+    level_counts = list(as.numeric(c_across(all_of(level_cols)))),
+    total_bb = sum(level_counts, na.rm = TRUE),
+    level_adj = if (total_bb > 0) {
+      sum(level_counts * level_constants[names(level_constants)], na.rm = TRUE) / total_bb
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup() %>%
+  select(-level_counts)  # optional: drop intermediate column
+
+big <- big %>% mutate(age_group = assign_age_group(age), age_2024 = age + 1, age_group_2024 = assign_age_group(age_2024)) %>% left_join(empirical_age_group_curve, by = "age_group") %>% mutate(age_adjustment = ifelse(age_group == age_group_2024, 0, adjustment)) %>% mutate(actual_projection = mean_fit_ev.x + level_adj + age_adjustment, proj_var = (sd_fit_ev)^2)
+
+big
+```
+
+```{r}
+to_join <- big %>% rename(recent_season = season) %>% select(recent_season, batter_id, actual_projection, proj_var, n)
+validate_projection <- validate %>% left_join(to_join, by = "batter_id") %>% mutate(lower_bound = actual_projection - sqrt(proj_var)*1.96, upper_bound = actual_projection + sqrt(proj_var)*1.96)
+
+validate_projection
+```
+
+Final projections
+```{r}
+validate_projection
+```
+
+```{r}
+write.csv(validate_projection, "marlins_data_project_final_projections.csv")
+```
+
+
+```{r}
+p <- unique(train$batter_id)
+q <- unique(validate$batter_id)
+
+setdiff(q, p)
+```
+
+
+```{r}
+library(ggplot2)
+
+example <- head(validate_projection, 5) %>% arrange(batter_id)
+
+ggplot(example, aes(x = reorder(batter_id, actual_projection), y = actual_projection)) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_errorbar(aes(ymin = lower_bound, ymax = upper_bound), width = 0.2, color = "steelblue") +
+  labs(
+    title = "Projected Exit Velocity by Player with 95% Confidence Intervals",
+    x = "Batter_id",
+    y = "Projected EV (mph)"
+  ) +
+  coord_flip() +  # flip for better readability if many players
+  theme_minimal(base_size = 13)
+
+```
+
